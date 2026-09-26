@@ -145,6 +145,7 @@
 import { Api } from './js/api.js';
 import { BoardEngine } from './js/engine.js';
 import { ReplayPlayer, OP_TYPE_META } from './js/replay.js';
+import { BoardSocket } from './js/ws.js';
 import {
   confirmDialog, escapeHtml, fmtBytes, fmtNum, fmtTime, initPage, qs, toast,
 } from './js/ui.js';
@@ -158,6 +159,9 @@ let currentBoard = qs('board') || localStorage.getItem('wb_replay_board') || '';
 let typeFilter = new Set();
 let authorFilter = '';
 let cachedOps = [];
+let liveSocket = null;
+let liveRefreshTimer = null;
+let playerLoadToken = null;
 
 /* ---------------------------------------------------------------- 图例与筛选 */
 $('legend').innerHTML = Object.entries(OP_TYPE_META)
@@ -198,9 +202,62 @@ async function loadBoards() {
 
 $('board-select').onchange = (e) => {
   currentBoard = e.target.value;
+  cachedOps = [];
+  liveSocket?.close();
+  liveSocket = null;
   localStorage.setItem('wb_replay_board', currentBoard);
   initPlayer();
 };
+
+/* ---------------------------------------------------------------- 实时订阅(只读) */
+function connectLiveSocket() {
+  liveSocket?.close();
+  if (!currentBoard || !player) return;
+  const boardId = currentBoard;
+  liveSocket = new BoardSocket(boardId, {
+    page: 'replay',
+    persist: false,
+    clientId: `replay-${boardId}-${crypto.randomUUID ? crypto.randomUUID().replaceAll('-', '') : Date.now()}`,
+  });
+  liveSocket.lastRev = player.headRev;
+  liveSocket.on('ops', (msg) => {
+    if (boardId !== currentBoard || !player) return;
+    player.ingestLiveOps(msg.ops || [], msg.head_rev);
+    scheduleLiveRefresh();
+  });
+  liveSocket.on('catchup', (msg) => {
+    if (boardId !== currentBoard || !player) return;
+    player.ingestLiveOps(msg.ops || [], liveSocket.lastRev);
+    scheduleLiveRefresh();
+  });
+  liveSocket.on('welcome', async (msg) => {
+    if (boardId !== currentBoard || !player) return;
+    if (msg.state && msg.state.rev > player.headRev) {
+      await player.load();
+      await loadOpsForList();
+      scheduleLiveRefresh();
+    }
+  });
+  liveSocket.connect();
+}
+
+async function pollLiveHistory() {
+  if (!currentBoard || !player) return;
+  const boardId = currentBoard;
+  try {
+    const index = await Api.history.index(boardId);
+    if (boardId !== currentBoard || !player) return;
+    const headRev = index.head_rev || 0;
+    if (headRev > player.headRev) {
+      const data = await Api.history.ops(boardId, { from_rev: player.headRev, limit: 2000 });
+      if (boardId !== currentBoard) return;
+      player.ingestLiveOps(data.ops || [], headRev);
+      scheduleLiveRefresh();
+    } else {
+      renderStats(index);
+    }
+  } catch { /* 静默等待下一轮 */ }
+}
 
 /* ---------------------------------------------------------------- 引擎与播放器 */
 const engine = new BoardEngine($('canvas-host'), {
@@ -253,14 +310,48 @@ function renderOpList(aroundRev = null) {
 }
 
 async function loadOpsForList() {
+  const boardId = currentBoard;
   try {
-    const data = await Api.history.ops(currentBoard, { from_rev: 0, limit: 2000 });
+    const data = await Api.history.ops(boardId, { from_rev: 0, limit: 2000 });
+    if (boardId !== currentBoard) return;
     cachedOps = data.ops || [];
-    const authors = [...new Set(cachedOps.map((o) => o.by).filter(Boolean))];
-    $('author-filter').innerHTML = '<option value="">全部成员</option>'
-      + authors.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
+    renderAuthors();
     renderOpList();
-  } catch (err) { toast(err.message || '加载操作流失败', 'error'); }
+  } catch (err) { if (boardId === currentBoard) toast(err.message || '加载操作流失败', 'error'); }
+}
+
+function renderAuthors() {
+  const authors = [...new Set(cachedOps.map((o) => o.by).filter(Boolean))];
+  $('author-filter').innerHTML = '<option value="">全部成员</option>'
+    + authors.map((a) => `<option value="${escapeHtml(a)}" ${authorFilter === a ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('');
+}
+
+async function refreshLiveHistory() {
+  if (!currentBoard || !player) return;
+  const boardId = currentBoard;
+  const fromRev = cachedOps.at(-1)?.rev || 0;
+  try {
+    const [data, index] = await Promise.all([
+      Api.history.ops(boardId, { from_rev: fromRev, limit: 2000 }),
+      Api.history.index(boardId),
+    ]);
+    if (boardId !== currentBoard) return;
+    if (fromRev === 0) cachedOps = data.ops || [];
+    else {
+      const known = new Set(cachedOps.map((o) => o.rev || 0));
+      cachedOps.push(...(data.ops || []).filter((o) => !known.has(o.rev || 0)));
+      cachedOps.sort((a, b) => (a.rev || 0) - (b.rev || 0));
+    }
+    renderAuthors();
+    renderOpList();
+    renderStats(index);
+    $('rev-label').textContent = `rev ${player.currentRev} / ${player.headRev}`;
+  } catch { /* 轮询失败保留当前视图 */ }
+}
+
+function scheduleLiveRefresh() {
+  clearTimeout(liveRefreshTimer);
+  liveRefreshTimer = setTimeout(refreshLiveHistory, 300);
 }
 
 function renderStats(index) {
@@ -293,6 +384,10 @@ function renderStats(index) {
 
 async function initPlayer() {
   if (!currentBoard) return;
+  const token = {};
+  playerLoadToken = token;
+  liveSocket?.close();
+  liveSocket = null;
   $('btn-open-board').onclick = () => {
     const mode = $('mode-badge').textContent === '思维导图' ? 'mindmap' : 'editor';
     location.href = `/${mode}.html?board=${currentBoard}`;
@@ -301,6 +396,7 @@ async function initPlayer() {
     const meta = await Api.boards.get(currentBoard);
     $('mode-badge').textContent = meta.board.mode === 'mindmap' ? '思维导图' : '白板';
   } catch { /* 忽略 */ }
+  if (token !== playerLoadToken) return;
   if (player) player.destroy();
   player = new ReplayPlayer({
     engine,
@@ -315,14 +411,20 @@ async function initPlayer() {
       }
     },
     onLoaded: (p) => {
+      if (token !== playerLoadToken) return;
       $('rev-label').textContent = `rev ${p.currentRev} / ${p.headRev}`;
       loadOpsForList();
-      Api.history.index(currentBoard).then(renderStats).catch(() => {});
+      const boardId = currentBoard;
+      Api.history.index(boardId).then((index) => {
+        if (boardId === currentBoard) renderStats(index);
+      }).catch(() => {});
     },
   });
   player.onEnd(() => { $('btn-play').textContent = '▶ 播放'; });
   await player.load();
+  if (token !== playerLoadToken) return;
   engine.page = 'replay';
+  connectLiveSocket();
 }
 
 /* ---------------------------------------------------------------- 播放控制 */
@@ -350,6 +452,7 @@ async function seek(rev) {
 
 /* 拖动进度条时同步按钮状态 */
 setInterval(() => { if (player) updatePlayBtn(); }, 400);
+setInterval(pollLiveHistory, 5000);
 
 /* ---------------------------------------------------------------- 压缩归档 */
 $('btn-compact').onclick = async () => {
@@ -363,6 +466,7 @@ $('btn-compact').onclick = async () => {
     toast(`压缩完成: ${res.compacted_shards} 个分片, 减少 ${res.ops_removed} 条冗余操作`, 'success', 5000);
     const index = await Api.history.index(currentBoard);
     renderStats(index);
+    await loadOpsForList();
   } catch (err) { toast(err.message || '压缩失败(需要所有者权限)', 'error'); }
 };
 

@@ -194,6 +194,7 @@
 <script type="module">
 import { Api } from './js/api.js';
 import { BoardEngine } from './js/engine.js';
+import { BoardSocket } from './js/ws.js';
 import { debounce, escapeHtml, fmtTime, getMe, initPage, modal, toast } from './js/ui.js';
 
 const me = await initPage('export', { gate: true, title: '导出' });
@@ -216,6 +217,8 @@ const state = {
 };
 const LS_BOARD = 'wb_export_board';
 const LS_HIST = 'wb_export_history';
+let exportSocket = null;
+let exportRefreshTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -234,11 +237,20 @@ async function loadBoards() {
 }
 
 async function selectBoard(id) {
-  state.boardId = id;
-  if (!id) { state.board = null; state.histIndex = null; updateAll(); return; }
-  localStorage.setItem(LS_BOARD, id);
+  const boardId = id;
+  state.boardId = boardId;
+  if (!boardId) {
+    exportSocket?.close();
+    exportSocket = null;
+    state.board = null;
+    state.histIndex = null;
+    updateAll();
+    return;
+  }
+  localStorage.setItem(LS_BOARD, boardId);
   try {
-    const [st, idx] = await Promise.all([Api.boards.state(id), Api.history.index(id)]);
+    const [st, idx] = await Promise.all([Api.boards.state(boardId), Api.history.index(boardId)]);
+    if (boardId !== state.boardId) return;
     state.board = st;
     state.histIndex = idx;
     state.histRev = idx.head_rev || 0;
@@ -247,9 +259,68 @@ async function selectBoard(id) {
     slider.value = state.histRev;
     renderSnapMarks();
     updateAll();
+    connectExportSocket(boardId);
   } catch (err) {
     toast(err.message || '加载白板失败', 'error');
   }
+}
+
+async function refreshSelectedBoard() {
+  if (!state.boardId || !state.board) return;
+  const boardId = state.boardId;
+  const before = JSON.stringify([
+    state.board.rev,
+    state.histIndex?.head_rev,
+    state.histIndex?.stats?.total,
+    state.histIndex?.stats?.shards,
+    state.histIndex?.snapshots?.length,
+    state.histIndex?.storage?.ops_bytes,
+  ]);
+  const [st, idx] = await Promise.all([Api.boards.state(boardId), Api.history.index(boardId)]);
+  if (boardId !== state.boardId || !state.board) return;
+  const after = JSON.stringify([
+    st.rev,
+    idx.head_rev,
+    idx.stats?.total,
+    idx.stats?.shards,
+    idx.snapshots?.length,
+    idx.storage?.ops_bytes,
+  ]);
+  if (before === after) return;
+  state.board = st;
+  state.histIndex = idx;
+  $('rev-slider').max = idx.head_rev || 0;
+  if (state.scope === 'history') state.histRev = Math.min(state.histRev, idx.head_rev || 0);
+  renderSnapMarks();
+  updateAll();
+}
+
+async function pollSelectedBoard() {
+  try { await refreshSelectedBoard(); } catch { /* 保留当前导出表单 */ }
+}
+
+function scheduleExportRefresh() {
+  clearTimeout(exportRefreshTimer);
+  exportRefreshTimer = setTimeout(pollSelectedBoard, 300);
+}
+
+function connectExportSocket(boardId) {
+  exportSocket?.close();
+  exportSocket = new BoardSocket(boardId, {
+    page: 'export',
+    persist: false,
+    clientId: `export-${boardId}-${crypto.randomUUID ? crypto.randomUUID().replaceAll('-', '') : Date.now()}`,
+  });
+  exportSocket.on('ops', () => {
+    if (exportSocket.boardId === boardId) scheduleExportRefresh();
+  });
+  exportSocket.on('catchup', (msg) => {
+    if (msg.ops?.length) scheduleExportRefresh();
+  });
+  exportSocket.on('welcome', (msg) => {
+    if (msg.state?.rev !== state.board?.rev) scheduleExportRefresh();
+  });
+  exportSocket.connect();
 }
 
 function renderSnapMarks() {
@@ -554,6 +625,7 @@ try {
 } catch (err) {
   toast(err.message || '加载失败', 'error');
 }
+setInterval(pollSelectedBoard, 5000);
 </script>
 </body>
 </html>

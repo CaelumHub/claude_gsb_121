@@ -322,13 +322,8 @@ async def export_board(board_id: str,
                          "application/json; charset=utf-8")
 
     if format == "ops":
-        shard_metas = hist.shards_index()
-        total = sum(m.get("count") or 0 for m in shard_metas
-                    if (m.get("last_rev") or 0) <= (rev if rev is not None else (1 << 60)))
         lines = [json.dumps(op, ensure_ascii=False)
-                 for op in hist.iter_ops(from_rev=0, to_rev=rev)]
-        if total:
-            lines = lines[:total]
+                 for op in hist.iter_ops(from_rev=0, to_rev=rev, limit=None)]
         return _download(f"{name}-ops.ndjson", "\n".join(lines) + "\n",
                          "application/x-ndjson; charset=utf-8")
 

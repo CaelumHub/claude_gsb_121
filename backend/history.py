@@ -22,7 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 from .crdt import BoardDoc, compact_ops_lossy, validate_op
-from .storage import JsonlLog, dir_size, read_json, shard_cache_key, write_json_atomic
+from .storage import (JsonlLog, dir_size, read_json, shard_cache_fingerprint,
+                      shard_cache_key, write_json_atomic)
 
 SHARD_META_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -45,13 +46,18 @@ class BoardHistory:
         if not ops:
             return None
         ts = ops[0].get("ts")
-        return self.log.append(ops, ts_ms=ts)
+        name = self.log.append(ops, ts_ms=ts)
+        self._invalidate_shard_cache(name)
+        return name
 
     def flush(self) -> None:
         name = self.log.shard_name()
         self.log.fsync_shard(name)
 
     # ---------------------------------------------------------------- 分片索引
+    def _invalidate_shard_cache(self, name: str) -> None:
+        SHARD_META_CACHE.pop(shard_cache_key(self.log.shard_path(name)), None)
+
     def _shard_meta(self, name: str) -> Dict[str, Any]:
         path = self.log.shard_path(name)
         try:
@@ -59,12 +65,22 @@ class BoardHistory:
         except OSError:
             return {"name": name, "count": 0}
         cache_key = shard_cache_key(path)
+        fingerprint = shard_cache_fingerprint(path, st)
         cached = SHARD_META_CACHE.get(cache_key)
-        if cached:
-            return cached
+        if cached and cached.get("_fingerprint") == fingerprint:
+            return cached["meta"]
         records = self.log.read_shard(name)
         revs = [r.get("rev", 0) for r in records if r.get("rev")]
         tss = [r.get("ts", 0) for r in records if r.get("ts")]
+        by_type: Dict[str, int] = {}
+        by_user: Dict[str, int] = {}
+        for rec in records:
+            otype = rec.get("type", "?")
+            if otype == "batch":
+                otype = f"batch({len(rec.get('ops') or [])})"
+            by_type[otype] = by_type.get(otype, 0) + 1
+            user = rec.get("by") or rec.get("site") or "?"
+            by_user[user] = by_user.get(user, 0) + 1
         meta = {
             "name": name,
             "count": len(records),
@@ -73,8 +89,10 @@ class BoardHistory:
             "last_rev": max(revs) if revs else None,
             "first_ts": min(tss) if tss else None,
             "last_ts": max(tss) if tss else None,
+            "by_type": by_type,
+            "by_user": by_user,
         }
-        SHARD_META_CACHE[cache_key] = meta
+        SHARD_META_CACHE[cache_key] = {"_fingerprint": fingerprint, "meta": meta}
         return meta
 
     def shards_index(self) -> List[Dict[str, Any]]:
@@ -94,11 +112,11 @@ class BoardHistory:
                 break
             for rec in self.log.read_shard(meta["name"]):
                 rev = rec.get("rev") or 0
-                if rev > from_rev and (to_rev is None or rev <= to_rev) and rec.get("type") != "move":
+                if rev > from_rev and (to_rev is None or rev <= to_rev):
                     out.append(rec)
-                    if limit and len(out) >= limit:
-                        return out
         out.sort(key=lambda r: r.get("rev") or 0)
+        if limit is not None:
+            return out[:limit]
         return out
 
     def recent_ops(self, since_rev: int, limit: int = config.MAX_CATCHUP_OPS) -> List[Dict[str, Any]]:
@@ -111,15 +129,11 @@ class BoardHistory:
         by_user: Dict[str, int] = {}
         total = 0
         for meta in self.shards_index():
-            total += meta.get("size", 0)
-        for rec in self.log.iter_all():
-            otype = rec.get("type", "?")
-            if otype == "batch":
-                subs = rec.get("ops") or []
-                otype = f"batch({len(subs)})"
-            by_type[otype] = by_type.get(otype, 0) + 1
-            user = rec.get("by") or rec.get("site") or "?"
-            by_user[user] = by_user.get(user, 0) + 1
+            total += meta.get("count", 0)
+            for otype, count in (meta.get("by_type") or {}).items():
+                by_type[otype] = by_type.get(otype, 0) + count
+            for user, count in (meta.get("by_user") or {}).items():
+                by_user[user] = by_user.get(user, 0) + count
         return {"total": total, "by_type": by_type, "by_user": by_user,
                 "shards": len(self.log.list_shards())}
 
@@ -238,7 +252,7 @@ class BoardHistory:
             compacted = compact_ops_lossy(records, config.MOVE_COALESCE_WINDOW_MS * 60)
             if len(compacted) < len(records):
                 self.log.rewrite_shard(name, compacted)
-                SHARD_META_CACHE.pop(self.log.shard_path(name), None)   # noqa: 保持原路径弹出协议
+                self._invalidate_shard_cache(name)
                 compacted_shards += 1
                 ops_removed += len(records) - len(compacted)
         return {"compacted_shards": compacted_shards, "ops_removed": ops_removed}
@@ -248,7 +262,7 @@ class BoardHistory:
         cutoff = int(time.time() * 1000) - days * 86400_000
         removed = self.log.prune_before(cutoff)
         for name in removed:
-            SHARD_META_CACHE.pop(self.log.shard_path(name), None)
+            self._invalidate_shard_cache(name)
         return removed
 
     # ---------------------------------------------------------------- 统计
@@ -276,7 +290,10 @@ class HistoryService:
         return hist
 
     def drop(self, board_id: str) -> None:
-        self._cache.pop(board_id, None)
+        hist = self._cache.pop(board_id, None)
+        if hist is not None:
+            for name in hist.log.list_shards():
+                hist._invalidate_shard_cache(name)
 
 
 history_service = HistoryService()

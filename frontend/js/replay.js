@@ -155,6 +155,33 @@ export class ReplayPlayer {
     if (this.onRev) this.onRev(this.currentRev, null);
   }
 
+  /** 追加实时产生的新操作; 若正停在末尾则跟随应用, 历史查看位置不被打断。 */
+  ingestLiveOps(ops, headRev = null) {
+    const oldHead = this.headRev;
+    if (headRev != null) this.headRev = Math.max(this.headRev, Number(headRev) || 0);
+    const known = new Set(this.ops.map((op) => op.rev || 0));
+    const fresh = (ops || [])
+      .filter((op) => (op.rev || 0) > 0 && !known.has(op.rev || 0))
+      .sort((a, b) => (a.rev || 0) - (b.rev || 0));
+    if (!fresh.length) {
+      this.drawTimeline();
+      return 0;
+    }
+    this.ops.push(...fresh);
+    if (this.currentRev >= oldHead && !this.playing) {
+      const touchedAll = new Set();
+      for (const op of fresh) {
+        const touched = mergeOp(this.shapes, op);
+        if (touched) touched.forEach((id) => touchedAll.add(id));
+        this.currentRev = op.rev || this.currentRev;
+      }
+      this.engine.onShapesChanged(touchedAll);
+      if (this.onRev) this.onRev(this.currentRev, fresh[fresh.length - 1]);
+    }
+    this.drawTimeline();
+    return fresh.length;
+  }
+
   async _ensureOpsUntil(rev) {
     if (this._fetching) return;
     const lastLoaded = this.ops.length ? this.ops[this.ops.length - 1].rev : this.opsStartRev;

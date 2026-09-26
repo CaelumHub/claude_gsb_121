@@ -253,8 +253,13 @@ def dir_size(path: str) -> int:
 
 
 def shard_cache_key(path: str) -> str:
-    """分片缓存键规约: 以分片文件名作为全局缓存标识。"""
-    return os.path.basename(path)
+    """分片缓存键: 使用绝对路径, 不同白板同一小时的分片不得共用缓存。"""
+    return os.path.abspath(path)
+
+
+def shard_cache_fingerprint(path: str, st: os.stat_result) -> Tuple[int, int]:
+    """文件当前内容标识; append/rewrite 后用于让旧缓存自然失效。"""
+    return (st.st_size, st.st_mtime_ns)
 
 
 def safe_id(raw: str, prefix: str = "", maxlen: int = 40) -> str:

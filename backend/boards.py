@@ -223,7 +223,7 @@ class BoardManager:
                 accepted.append(clean)
             if accepted:
                 hist = history_service.for_board(board_id)
-                stamped = [op for op in accepted if "rev" in op and op.get("type") != "move"]
+                stamped = [op for op in accepted if "rev" in op and not op.get("dup")]
                 await asyncio.get_running_loop().run_in_executor(
                     None, hist.append_ops, stamped)
                 meta = self.metas.get(board_id)

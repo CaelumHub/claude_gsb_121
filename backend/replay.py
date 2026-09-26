@@ -22,16 +22,10 @@ from .models import CompactReq
 
 router = APIRouter(prefix="/api/boards", tags=["history"])
 
-_INDEX_VIEW_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
 @router.get("/{board_id}/history/index")
 async def history_index(board_id: str,
                         user: Dict[str, Any] = Depends(auth.current_user)):
     await board_ctx(board_id, user, "viewer")
-    cached = _INDEX_VIEW_CACHE.get(board_id)
-    if cached is not None:
-        return cached
     hist = history_service.for_board(board_id)
     doc = await manager.get_doc(board_id)
     loop = asyncio.get_running_loop()
@@ -45,7 +39,6 @@ async def history_index(board_id: str,
         "stats": await loop.run_in_executor(None, hist.op_stats),
         "storage": await loop.run_in_executor(None, hist.storage_stats),
     }
-    _INDEX_VIEW_CACHE[board_id] = response
     return response
 
 
@@ -62,7 +55,8 @@ async def history_ops(board_id: str,
     hist = history_service.for_board(board_id)
     loop = asyncio.get_running_loop()
     ops = await loop.run_in_executor(
-        None, lambda: hist.iter_ops(from_rev=from_rev, to_rev=to_rev, limit=limit))
+        None, lambda: hist.iter_ops(from_rev=from_rev, to_rev=to_rev, limit=None))
+    total_count = len(ops)
     if op_type:
         wanted = set(op_type.split(","))
         ops = [o for o in ops if o.get("type") in wanted]
@@ -74,7 +68,7 @@ async def history_ops(board_id: str,
         "ops": ops[:limit],
         "count": len(ops),
         "from_rev": from_rev,
-        "truncated": len(ops) > limit,
+        "truncated": total_count > limit or len(ops) > limit,
     }
 
 
@@ -91,7 +85,10 @@ async def replay_window(board_id: str,
     target = max(0, (doc.head_rev if rev is None else rev) - 1)
     loop = asyncio.get_running_loop()
     window = await loop.run_in_executor(
-        None, lambda: hist.replay_window(target, coalesce=coalesce, page_limit=limit))
+        None, lambda: hist.replay_window(target, coalesce=coalesce, page_limit=limit + 1))
+    window_ops = window.get("ops") or []
+    has_more = len(window_ops) > limit
+    window_ops = window_ops[:limit]
     snapshot = window.get("snapshot") or {}
     snapshot_shapes = snapshot.get("shapes") or {}
     return {
@@ -103,9 +100,9 @@ async def replay_window(board_id: str,
             "rev": snapshot.get("rev"),
             "shapes": [s for s in snapshot_shapes.values() if not s.get("deleted")],
         } if snapshot else None,
-        "ops": window.get("ops") or [],
+        "ops": window_ops,
         "coalesced": bool(coalesce),
-        "has_more": len(window.get("ops") or []) >= limit,
+        "has_more": has_more,
     }
 
 
