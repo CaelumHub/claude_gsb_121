@@ -13,6 +13,7 @@ import asyncio
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from . import auth, config
 from .boards import board_ctx, manager
@@ -21,17 +22,13 @@ from .history import history_service
 from .models import CompactReq
 
 router = APIRouter(prefix="/api/boards", tags=["history"])
-
-_INDEX_VIEW_CACHE: Dict[str, Dict[str, Any]] = {}
+NO_STORE = {"Cache-Control": "no-store"}
 
 
 @router.get("/{board_id}/history/index")
 async def history_index(board_id: str,
                         user: Dict[str, Any] = Depends(auth.current_user)):
     await board_ctx(board_id, user, "viewer")
-    cached = _INDEX_VIEW_CACHE.get(board_id)
-    if cached is not None:
-        return cached
     hist = history_service.for_board(board_id)
     doc = await manager.get_doc(board_id)
     loop = asyncio.get_running_loop()
@@ -45,15 +42,14 @@ async def history_index(board_id: str,
         "stats": await loop.run_in_executor(None, hist.op_stats),
         "storage": await loop.run_in_executor(None, hist.storage_stats),
     }
-    _INDEX_VIEW_CACHE[board_id] = response
-    return response
+    return JSONResponse(response, headers=NO_STORE)
 
 
 @router.get("/{board_id}/history/ops")
 async def history_ops(board_id: str,
                       from_rev: int = Query(default=0, ge=0),
                       to_rev: Optional[int] = Query(default=None),
-                      limit: int = Query(default=300, ge=1, le=2000),
+                      limit: int = Query(default=2000, ge=1, le=5000),
                       op_type: str = Query(default=""),
                       author: str = Query(default=""),
                       coalesce: bool = Query(default=False),
@@ -62,7 +58,8 @@ async def history_ops(board_id: str,
     hist = history_service.for_board(board_id)
     loop = asyncio.get_running_loop()
     ops = await loop.run_in_executor(
-        None, lambda: hist.iter_ops(from_rev=from_rev, to_rev=to_rev, limit=limit))
+        None, lambda: hist.iter_ops(from_rev=from_rev, to_rev=to_rev))
+    truncated = len(ops) > limit
     if op_type:
         wanted = set(op_type.split(","))
         ops = [o for o in ops if o.get("type") in wanted]
@@ -70,12 +67,13 @@ async def history_ops(board_id: str,
         ops = [o for o in ops if (o.get("by") or "") == author or (o.get("site") or "") == author]
     if coalesce:
         ops = coalesce_moves(ops, config.MOVE_COALESCE_WINDOW_MS * 60)
-    return {
-        "ops": ops[:limit],
-        "count": len(ops),
+    page = ops[:limit]
+    return JSONResponse({
+        "ops": page,
+        "count": len(page),
         "from_rev": from_rev,
-        "truncated": len(ops) > limit,
-    }
+        "truncated": truncated,
+    }, headers=NO_STORE)
 
 
 @router.get("/{board_id}/history/replay")
@@ -88,13 +86,13 @@ async def replay_window(board_id: str,
     await board_ctx(board_id, user, "viewer")
     hist = history_service.for_board(board_id)
     doc = await manager.get_doc(board_id)
-    target = max(0, (doc.head_rev if rev is None else rev) - 1)
+    target = doc.head_rev if rev is None else max(0, rev)
     loop = asyncio.get_running_loop()
     window = await loop.run_in_executor(
         None, lambda: hist.replay_window(target, coalesce=coalesce, page_limit=limit))
     snapshot = window.get("snapshot") or {}
     snapshot_shapes = snapshot.get("shapes") or {}
-    return {
+    return JSONResponse({
         "board_id": board_id,
         "target_rev": target,
         "head_rev": doc.head_rev,
@@ -106,7 +104,7 @@ async def replay_window(board_id: str,
         "ops": window.get("ops") or [],
         "coalesced": bool(coalesce),
         "has_more": len(window.get("ops") or []) >= limit,
-    }
+    }, headers=NO_STORE)
 
 
 @router.post("/{board_id}/history/compact")

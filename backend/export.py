@@ -275,7 +275,8 @@ def _download(filename: str, content: str, media_type: str) -> Response:
     return Response(
         content=content,
         media_type=media_type,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+                 "Cache-Control": "no-store"},
     )
 
 
@@ -292,7 +293,7 @@ async def export_board(board_id: str,
 
     if rev is not None:
         folded = await asyncio.get_running_loop().run_in_executor(
-            None, hist.fold_window, max(0, rev - 1))
+            None, hist.fold_window, rev)
         shapes = folded["shapes"]
     else:
         doc = await manager.get_doc(board_id)
@@ -322,14 +323,9 @@ async def export_board(board_id: str,
                          "application/json; charset=utf-8")
 
     if format == "ops":
-        shard_metas = hist.shards_index()
-        total = sum(m.get("count") or 0 for m in shard_metas
-                    if (m.get("last_rev") or 0) <= (rev if rev is not None else (1 << 60)))
         lines = [json.dumps(op, ensure_ascii=False)
                  for op in hist.iter_ops(from_rev=0, to_rev=rev)]
-        if total:
-            lines = lines[:total]
-        return _download(f"{name}-ops.ndjson", "\n".join(lines) + "\n",
+        return _download(f"{name}-ops.ndjson", "\n".join(lines) + ("\n" if lines else ""),
                          "application/x-ndjson; charset=utf-8")
 
     raise HTTPException(status_code=400, detail="format 仅支持 json / svg / ops")

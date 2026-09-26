@@ -213,6 +213,7 @@ const state = {
   pngGrid: false,
   svgBg: '#ffffff',
   svgGrid: false,
+  selectToken: 0,
 };
 const LS_BOARD = 'wb_export_board';
 const LS_HIST = 'wb_export_history';
@@ -234,11 +235,13 @@ async function loadBoards() {
 }
 
 async function selectBoard(id) {
+  const token = ++state.selectToken;
   state.boardId = id;
   if (!id) { state.board = null; state.histIndex = null; updateAll(); return; }
   localStorage.setItem(LS_BOARD, id);
   try {
     const [st, idx] = await Promise.all([Api.boards.state(id), Api.history.index(id)]);
+    if (token !== state.selectToken || state.boardId !== id) return;
     state.board = st;
     state.histIndex = idx;
     state.histRev = idx.head_rev || 0;
@@ -251,6 +254,25 @@ async function selectBoard(id) {
     toast(err.message || '加载白板失败', 'error');
   }
 }
+
+async function refreshSelectedBoard() {
+  const boardId = state.boardId;
+  const token = state.selectToken;
+  if (!boardId || !state.board || document.hidden) return;
+  try {
+    const [st, idx] = await Promise.all([Api.boards.state(boardId), Api.history.index(boardId)]);
+    if (token !== state.selectToken || boardId !== state.boardId) return;
+    state.board = st;
+    state.histIndex = idx;
+    const slider = $('rev-slider');
+    slider.max = idx.head_rev || 0;
+    if (state.scope === 'history' && state.histRev > idx.head_rev) state.histRev = idx.head_rev;
+    slider.value = state.histRev;
+    renderSnapMarks();
+    updateAll();
+  } catch { /* 后台刷新失败时保留当前页面数据 */ }
+}
+setInterval(refreshSelectedBoard, 4000);
 
 function renderSnapMarks() {
   const strip = $('rev-strip');

@@ -77,11 +77,12 @@ export class ReplayPlayer {
    * @param {object} deps { engine(BoardEngine readOnly), boardId,
    *   onRev(rev, op), onStateChange, onLoaded(meta), timeline(Canvas 可选) }
    */
-  constructor({ engine, boardId, onRev = null, onLoaded = null, timeline = null }) {
+  constructor({ engine, boardId, onRev = null, onLoaded = null, onIndex = null, timeline = null }) {
     this.engine = engine;
     this.boardId = boardId;
     this.onRev = onRev;
     this.onLoaded = onLoaded;
+    this.onIndex = onIndex;
     this.timeline = timeline;
 
     this.shapes = new Map();
@@ -102,6 +103,8 @@ export class ReplayPlayer {
     this._raf = null;
     this._fetching = false;
     this._timelineHover = null;
+    this._destroyed = false;
+    this._loadSeq = 0;
 
     if (timeline) this._bindTimeline();
     this._loop = this._loop.bind(this);
@@ -110,9 +113,11 @@ export class ReplayPlayer {
 
   /* ------------------------------------------------------------ 加载 */
   async load(atRev = null) {
+    const seq = ++this._loadSeq;
     const data = await Api.history.replay(this.boardId, {
       rev: atRev ?? undefined, coalesce: false, limit: PAGE_SIZE,
     });
+    if (this._destroyed || seq !== this._loadSeq) return this;
     this.headRev = data.head_rev;
     this.shapes.clear();
     if (data.snapshot?.shapes) {
@@ -126,10 +131,12 @@ export class ReplayPlayer {
     this._applyOpsUpTo(atRev ?? this.headRev, true);
 
     const index = await Api.history.index(this.boardId);
+    if (this._destroyed || seq !== this._loadSeq) return this;
     this.snapshots = index.snapshots || [];
     this.shards = index.shards || [];
     this.stats = index.stats || null;
     this.headRev = index.head_rev ?? this.headRev;
+    if (this.onIndex) this.onIndex(index);
     this.engine.rebuildIndex();
     this.engine.fitToContent();
     this.drawTimeline();
@@ -139,8 +146,10 @@ export class ReplayPlayer {
 
   /** 跳转: 服务端找快照折叠, 前端一次导入(快速回放核心) */
   async seek(rev) {
+    const seq = ++this._loadSeq;
     rev = Math.max(0, Math.min(this.headRev, Math.round(rev)));
     const data = await Api.history.replay(this.boardId, { rev, coalesce: true, limit: 5000 });
+    if (this._destroyed || seq !== this._loadSeq) return;
     this.shapes.clear();
     if (data.snapshot?.shapes) {
       for (const s of data.snapshot.shapes) this.shapes.set(s.id, { ...s });
@@ -159,12 +168,13 @@ export class ReplayPlayer {
     if (this._fetching) return;
     const lastLoaded = this.ops.length ? this.ops[this.ops.length - 1].rev : this.opsStartRev;
     if (lastLoaded >= rev) return;
+    const seq = this._loadSeq;
     this._fetching = true;
     try {
       const data = await Api.history.ops(this.boardId, {
         from_rev: lastLoaded, limit: PAGE_SIZE,
       });
-      if (data.ops?.length) this.ops.push(...data.ops);
+      if (!this._destroyed && seq === this._loadSeq && data.ops?.length) this.ops.push(...data.ops);
     } finally {
       this._fetching = false;
     }
@@ -290,6 +300,9 @@ export class ReplayPlayer {
   onEnd(fn) { this._emitEnd = fn; }
 
   destroy() {
+    this._destroyed = true;
+    this._loadSeq += 1;
+    this.pause();
     if (this._raf) cancelAnimationFrame(this._raf);
   }
 

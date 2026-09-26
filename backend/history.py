@@ -41,11 +41,20 @@ class BoardHistory:
 
     # ---------------------------------------------------------------- 写入
     def append_ops(self, ops: List[Dict[str, Any]]) -> Optional[str]:
-        """把已分配 rev 的操作追加到其时间戳所属分片。返回分片名。"""
+        """把已分配 rev 的操作追加到各自时间戳所属分片。返回首个分片名。"""
         if not ops:
             return None
-        ts = ops[0].get("ts")
-        return self.log.append(ops, ts_ms=ts)
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+        for op in ops:
+            name = self.log.shard_name(op.get("ts"))
+            buckets.setdefault(name, []).append(op)
+        first_name: Optional[str] = None
+        for name in sorted(buckets):
+            ts = buckets[name][0].get("ts")
+            self.log.append(buckets[name], ts_ms=ts)
+            SHARD_META_CACHE.pop(self.log.shard_path(name), None)
+            first_name = first_name or name
+        return first_name
 
     def flush(self) -> None:
         name = self.log.shard_name()
@@ -59,9 +68,10 @@ class BoardHistory:
         except OSError:
             return {"name": name, "count": 0}
         cache_key = shard_cache_key(path)
+        signature = (st.st_size, st.st_mtime_ns)
         cached = SHARD_META_CACHE.get(cache_key)
-        if cached:
-            return cached
+        if cached and cached.get("_signature") == signature:
+            return {k: v for k, v in cached.items() if not k.startswith("_")}
         records = self.log.read_shard(name)
         revs = [r.get("rev", 0) for r in records if r.get("rev")]
         tss = [r.get("ts", 0) for r in records if r.get("ts")]
@@ -73,6 +83,7 @@ class BoardHistory:
             "last_rev": max(revs) if revs else None,
             "first_ts": min(tss) if tss else None,
             "last_ts": max(tss) if tss else None,
+            "_signature": signature,
         }
         SHARD_META_CACHE[cache_key] = meta
         return meta
@@ -94,7 +105,7 @@ class BoardHistory:
                 break
             for rec in self.log.read_shard(meta["name"]):
                 rev = rec.get("rev") or 0
-                if rev > from_rev and (to_rev is None or rev <= to_rev) and rec.get("type") != "move":
+                if rev > from_rev and (to_rev is None or rev <= to_rev):
                     out.append(rec)
                     if limit and len(out) >= limit:
                         return out
@@ -109,9 +120,8 @@ class BoardHistory:
     def op_stats(self) -> Dict[str, Any]:
         by_type: Dict[str, int] = {}
         by_user: Dict[str, int] = {}
-        total = 0
-        for meta in self.shards_index():
-            total += meta.get("size", 0)
+        shards = self.shards_index()
+        total = sum(int(meta.get("count") or 0) for meta in shards)
         for rec in self.log.iter_all():
             otype = rec.get("type", "?")
             if otype == "batch":
@@ -121,7 +131,7 @@ class BoardHistory:
             user = rec.get("by") or rec.get("site") or "?"
             by_user[user] = by_user.get(user, 0) + 1
         return {"total": total, "by_type": by_type, "by_user": by_user,
-                "shards": len(self.log.list_shards())}
+                "shards": len(shards)}
 
     # ---------------------------------------------------------------- 快照
     def snapshots_index(self) -> List[Dict[str, Any]]:

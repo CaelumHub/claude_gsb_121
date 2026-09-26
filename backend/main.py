@@ -144,7 +144,7 @@ async def system_stats(user: Dict[str, Any] = Depends(auth.require_admin)):
     for bid in boards:
         hist = history_service.for_board(bid)
         total_ops_bytes += hist.storage_stats().get("ops_bytes", 0)
-        total_ops += sum((m.get("size") or 0) for m in hist.shards_index())
+        total_ops += sum((m.get("count") or 0) for m in hist.shards_index())
     return {
         "boards": len(manager.docs),
         "boards_in_memory": len(boards),

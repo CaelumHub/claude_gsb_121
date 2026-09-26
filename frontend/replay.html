@@ -158,6 +158,8 @@ let currentBoard = qs('board') || localStorage.getItem('wb_replay_board') || '';
 let typeFilter = new Set();
 let authorFilter = '';
 let cachedOps = [];
+let loadEpoch = 0;
+let statsTimer = null;
 
 /* ---------------------------------------------------------------- 图例与筛选 */
 $('legend').innerHTML = Object.entries(OP_TYPE_META)
@@ -253,14 +255,21 @@ function renderOpList(aroundRev = null) {
 }
 
 async function loadOpsForList() {
+  const epoch = loadEpoch;
+  const boardId = currentBoard;
   try {
-    const data = await Api.history.ops(currentBoard, { from_rev: 0, limit: 2000 });
+    const data = await Api.history.ops(boardId, { from_rev: 0, limit: 5000 });
+    if (epoch !== loadEpoch || boardId !== currentBoard) return;
     cachedOps = data.ops || [];
     const authors = [...new Set(cachedOps.map((o) => o.by).filter(Boolean))];
+    const selectedAuthor = authorFilter;
     $('author-filter').innerHTML = '<option value="">全部成员</option>'
-      + authors.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
+      + authors.map((a) => `<option value="${escapeHtml(a)}" ${a === selectedAuthor ? 'selected' : ''}>${escapeHtml(a)}</option>`).join('');
+    authorFilter = selectedAuthor;
     renderOpList();
-  } catch (err) { toast(err.message || '加载操作流失败', 'error'); }
+  } catch (err) {
+    if (epoch === loadEpoch && boardId === currentBoard) toast(err.message || '加载操作流失败', 'error');
+  }
 }
 
 function renderStats(index) {
@@ -291,14 +300,48 @@ function renderStats(index) {
     : '尚无快照(将从头折叠)';
 }
 
+function applyHistoryIndex(index) {
+  if (!player) return;
+  player.snapshots = index.snapshots || [];
+  player.shards = index.shards || [];
+  player.stats = index.stats || null;
+  player.headRev = index.head_rev ?? player.headRev;
+  renderStats(index);
+  player.drawTimeline();
+}
+
+let historyRefreshing = false;
+async function refreshHistoryIfChanged(forceOps = false) {
+  const epoch = loadEpoch;
+  if (!currentBoard || !player || historyRefreshing || document.hidden || epoch !== loadEpoch) return;
+  const boardId = currentBoard;
+  const previousHead = player.headRev;
+  historyRefreshing = true;
+  try {
+    const index = await Api.history.index(boardId);
+    if (epoch !== loadEpoch || boardId !== currentBoard || !player) return;
+    applyHistoryIndex(index);
+    if (forceOps || index.head_rev > previousHead) await loadOpsForList();
+  } catch { /* 后台刷新失败时保留当前数据 */ } finally {
+    if (epoch === loadEpoch && boardId === currentBoard) historyRefreshing = false;
+  }
+}
+
 async function initPlayer() {
   if (!currentBoard) return;
+  const epoch = ++loadEpoch;
+  cachedOps = [];
+  authorFilter = '';
+  $('op-list').innerHTML = '';
+  $('author-filter').innerHTML = '<option value="">全部成员</option>';
+  if (statsTimer) clearInterval(statsTimer);
   $('btn-open-board').onclick = () => {
     const mode = $('mode-badge').textContent === '思维导图' ? 'mindmap' : 'editor';
     location.href = `/${mode}.html?board=${currentBoard}`;
   };
   try {
     const meta = await Api.boards.get(currentBoard);
+    if (epoch !== loadEpoch) return;
     $('mode-badge').textContent = meta.board.mode === 'mindmap' ? '思维导图' : '白板';
   } catch { /* 忽略 */ }
   if (player) player.destroy();
@@ -314,15 +357,21 @@ async function initPlayer() {
         if (cur) cur.classList.remove('current');
       }
     },
-    onLoaded: (p) => {
-      $('rev-label').textContent = `rev ${p.currentRev} / ${p.headRev}`;
+    onLoaded: () => {
+      if (epoch !== loadEpoch) return;
+      $('rev-label').textContent = `rev ${player.currentRev} / ${player.headRev}`;
       loadOpsForList();
-      Api.history.index(currentBoard).then(renderStats).catch(() => {});
+    },
+    onIndex: (index) => {
+      if (epoch !== loadEpoch) return;
+      applyHistoryIndex(index);
     },
   });
   player.onEnd(() => { $('btn-play').textContent = '▶ 播放'; });
   await player.load();
+  if (epoch !== loadEpoch) return;
   engine.page = 'replay';
+  statsTimer = setInterval(() => { refreshHistoryIfChanged(); }, 4000);
 }
 
 /* ---------------------------------------------------------------- 播放控制 */
